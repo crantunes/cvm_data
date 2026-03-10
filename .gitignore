@@ -1,0 +1,7 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*
+DB_USER=pesquisador
+DB_PASSWORD=pesquisador
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=cvm_data
