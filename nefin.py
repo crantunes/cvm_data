@@ -172,41 +172,61 @@ def parse_ivol_br(raw: bytes) -> pd.DataFrame:
         )
     log.info(f"  Abas no XLS: {xls.sheet_names}")
 
+    # Estrutura real do IVol-BR.xls (verificada 13/03/2026):
+    # Sheet1 com colunas: year, month, day, ivolbr
+    # Não existe coluna Date — construir a partir de year/month/day
+    # Variance Premium e Risk Aversion estão em arquivos XLS separados
+    # (baixados individualmente se necessário — não estão no IVol-BR.xls)
     frames = {}
     for sheet in xls.sheet_names:
         df_s = xls.parse(sheet)
-        df_s.columns = [str(c).strip() for c in df_s.columns]
+        df_s.columns = [str(c).strip().lower() for c in df_s.columns]
 
-        # Identificar coluna de data
-        date_col = next((c for c in df_s.columns if "date" in c.lower()), None)
-        if date_col is None:
-            log.warning(f"  Aba '{sheet}' sem coluna Date — ignorada")
+        # Caso 1: colunas year/month/day (formato real do NEFIN)
+        if all(c in df_s.columns for c in ["year", "month", "day"]):
+            df_s["data"] = pd.to_datetime(
+                df_s[["year", "month", "day"]].rename(
+                    columns={"year": "year", "month": "month", "day": "day"}
+                ),
+                errors="coerce"
+            ).dt.date
+            df_s = df_s.dropna(subset=["data"])
+            df_s = df_s.drop(columns=["year", "month", "day"])
+            frames[sheet] = df_s.set_index("data")
+
+        # Caso 2: coluna date explícita (fallback)
+        elif any("date" in c for c in df_s.columns):
+            date_col = next(c for c in df_s.columns if "date" in c)
+            df_s = df_s.rename(columns={date_col: "data"})
+            df_s["data"] = pd.to_datetime(df_s["data"], errors="coerce").dt.date
+            df_s = df_s.dropna(subset=["data"])
+            frames[sheet] = df_s.set_index("data")
+
+        else:
+            log.warning(f"  Aba '{sheet}' sem coluna de data reconhecida — ignorada")
+            log.warning(f"  Colunas encontradas: {list(df_s.columns)}")
             continue
-
-        df_s = df_s.rename(columns={date_col: "data"})
-        df_s["data"] = pd.to_datetime(df_s["data"], errors="coerce").dt.date
-        df_s = df_s.dropna(subset=["data"])
-        frames[sheet] = df_s.set_index("data")
 
     if not frames:
         raise ValueError("Nenhuma aba válida encontrada no IVol-BR.xls")
 
-    # Merge de todas as abas por data
     result = pd.concat(frames.values(), axis=1)
 
     # Mapear colunas para os nomes da tabela
+    # Formato real: ivolbr → ivol_br
     col_map = {}
     for col in result.columns:
-        low = col.lower()
-        if "ivol" in low or "volatility" in low:
+        low = col.lower().replace("-", "").replace(" ", "")
+        if low in ("ivolbr", "ivol"):
             col_map[col] = "ivol_br"
         elif "variance" in low and "premium" in low:
             col_map[col] = "variance_premium"
-        elif "aversion" in low or "risk av" in low:
+        elif "aversion" in low:
             col_map[col] = "risk_aversion"
     result = result.rename(columns=col_map)
 
-    # Garantir colunas mínimas
+    # Variance Premium e Risk Aversion são arquivos separados no NEFIN
+    # Se não existem no XLS principal, ficam NULL (aceitável)
     for c in ["ivol_br", "variance_premium", "risk_aversion"]:
         if c not in result.columns:
             result[c] = None

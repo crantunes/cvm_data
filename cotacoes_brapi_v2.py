@@ -75,18 +75,72 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ─── DETECÇÃO AUTOMÁTICA DO SCHEMA ────────────────────────────────────────────
+
+def detect_nome_empresa_col(conn) -> str:
+    """
+    Detecta o nome real da coluna de 'nome da empresa' em cad_cia_aberta.
+    Candidatos comuns nos dados CVM: nome_empresa, razao_social, nome_fantasia,
+    denom_social, denom_comerc.
+    Retorna o nome da primeira coluna encontrada, ou None se nenhuma existir.
+    """
+    QUERY_COLS = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'cvm_data'
+          AND table_name   = 'cad_cia_aberta'
+        ORDER BY ordinal_position
+    """
+    candidates = [
+        "nome_empresa", "razao_social", "denom_social",
+        "denom_comerc", "nome_fantasia", "nome",
+    ]
+    with conn.cursor() as cur:
+        cur.execute(QUERY_COLS)
+        cols_existentes = {row[0].lower() for row in cur.fetchall()}
+
+    log.info(f"  Colunas em cad_cia_aberta: {sorted(cols_existentes)}")
+
+    for candidate in candidates:
+        if candidate in cols_existentes:
+            log.info(f"  Coluna de nome detectada: '{candidate}'")
+            return candidate
+
+    log.warning("  Nenhuma coluna de nome reconhecida em cad_cia_aberta!")
+    log.warning(f"  Colunas disponíveis: {sorted(cols_existentes)}")
+    return None
+
+
+def detect_cnpj_col_cia_aberta(conn) -> str:
+    """
+    Detecta o nome da coluna de CNPJ em cad_cia_aberta.
+    Candidatos: cnpj_companhia, cnpj, cd_cnpj.
+    """
+    QUERY_COLS = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'cvm_data'
+          AND table_name   = 'cad_cia_aberta'
+        ORDER BY ordinal_position
+    """
+    candidates = ["cnpj_companhia", "cnpj", "cd_cnpj"]
+    with conn.cursor() as cur:
+        cur.execute(QUERY_COLS)
+        cols_existentes = {row[0].lower() for row in cur.fetchall()}
+
+    for candidate in candidates:
+        if candidate in cols_existentes:
+            log.info(f"  Coluna de CNPJ em cad_cia_aberta detectada: '{candidate}'")
+            return candidate
+
+    log.warning(f"  CNPJ não detectado em cad_cia_aberta. Colunas: {sorted(cols_existentes)}")
+    return None
+
+
 # ─── QUERY: tickers de IPO da amostra ─────────────────────────────────────────
 
-# ── Query principal: tickers via join IPO + cad_valor_mobiliario ─────────────
-# CNPJs normalizados com REGEXP_REPLACE para eliminar diferenças de formatação.
-# ATENÇÃO: ipo_oferta_distribuicao tem ~57% de cnpj_emissor NULL.
-# Estratégia: buscar tickers de DUAS formas e fazer UNION:
-#   (A) Join direto quando cnpj_emissor não é NULL
-#   (B) Fallback: todos os tickers de ações em cad_valor_mobiliario
-#       (para garantir cobertura mesmo com CNPJs faltantes)
-
-QUERY_TICKERS_IPO = """
-    -- (A) tickers com IPO confirmado via cnpj_emissor
+QUERY_TICKERS_IPO_PARTE_A = """
+    -- (A) tickers com IPO confirmado via cnpj_emissor (join direto por CNPJ normalizado)
     SELECT DISTINCT
         v.codigo_negociacao                         AS ticker,
         o.cnpj_emissor,
@@ -101,34 +155,107 @@ QUERY_TICKERS_IPO = """
       AND TRIM(v.codigo_negociacao) <> ''
       AND v.valor_mobiliario    ILIKE ANY(ARRAY['%Ações Ordinárias%','%Ações Preferenciais%','%Units%'])
     GROUP BY v.codigo_negociacao, o.cnpj_emissor
+"""
 
-    UNION
-
-    -- (B) fallback: nome do emissor da oferta → nome da companhia no FCA
+# Parte B é construída dinamicamente com o nome correto das colunas
+QUERY_TICKERS_IPO_PARTE_B_TEMPLATE = """
+    -- (B) fallback: join por nome do emissor → cad_cia_aberta → cad_valor_mobiliario
+    --     Necessário porque ~57%% dos IPOs de ações têm cnpj_emissor NULL
     SELECT DISTINCT
         v.codigo_negociacao                         AS ticker,
         o.cnpj_emissor,
         MIN(o.data_registro_oferta)                 AS data_ipo
     FROM cvm_data.ipo_oferta_distribuicao   o
     JOIN cvm_data.cad_cia_aberta            c
-        ON UPPER(TRIM(c.nome_empresa)) = UPPER(TRIM(o.nome_emissor))
+        ON UPPER(TRIM(c.{col_nome})) = UPPER(TRIM(o.nome_emissor))
     JOIN cvm_data.cad_valor_mobiliario      v
-        ON v.cnpj_companhia = c.cnpj_companhia
+        ON REGEXP_REPLACE(v.cnpj_companhia, '[^0-9]', '', 'g')
+         = REGEXP_REPLACE(c.{col_cnpj},     '[^0-9]', '', 'g')
     WHERE o.oferta_inicial      = 'S'
       AND o.nome_emissor        IS NOT NULL
       AND v.codigo_negociacao   IS NOT NULL
       AND TRIM(v.codigo_negociacao) <> ''
       AND v.valor_mobiliario    ILIKE ANY(ARRAY['%Ações Ordinárias%','%Ações Preferenciais%','%Units%'])
     GROUP BY v.codigo_negociacao, o.cnpj_emissor
-
-    ORDER BY data_ipo
 """
+
+QUERY_ORDER = "\n    ORDER BY data_ipo\n"
+
+
+def build_query_tickers_ipo(conn) -> str:
+    """
+    Monta a query de tickers dinamicamente, detectando os nomes reais das colunas
+    em cad_cia_aberta antes de construir o UNION.
+    Se não conseguir detectar as colunas, usa apenas a parte A (join por CNPJ).
+    """
+    col_nome = detect_nome_empresa_col(conn)
+    col_cnpj = detect_cnpj_col_cia_aberta(conn)
+
+    if col_nome and col_cnpj:
+        parte_b = QUERY_TICKERS_IPO_PARTE_B_TEMPLATE.format(
+            col_nome=col_nome,
+            col_cnpj=col_cnpj,
+        )
+        query = QUERY_TICKERS_IPO_PARTE_A + "\n    UNION\n" + parte_b + QUERY_ORDER
+        log.info("  Query: UNION (A) CNPJ + (B) nome_emissor ativado")
+    else:
+        query = QUERY_TICKERS_IPO_PARTE_A + QUERY_ORDER
+        log.warning("  Query: usando APENAS parte A (join por CNPJ) — parte B desativada por coluna não detectada")
+
+    return query
 
 
 def get_tickers_ipo(conn) -> pd.DataFrame:
-    df = pd.read_sql(QUERY_TICKERS_IPO, conn)
-    log.info(f"  Tickers IPO da amostra: {len(df):,}")
+    query = build_query_tickers_ipo(conn)
+    log.info("\n  Executando query de tickers IPO...")
+    df = pd.read_sql(query, conn)
+    log.info(f"  Tickers IPO encontrados: {len(df):,}")
+
+    if df.empty:
+        log.warning("  ATENÇÃO: Nenhum ticker retornado! Verifique o diagnóstico abaixo:")
+        _diagnostico_join(conn)
+
     return df
+
+
+def _diagnostico_join(conn):
+    """Diagnóstico rápido quando a query principal retorna 0 tickers."""
+    checks = [
+        ("ipo_oferta_distribuicao total", "SELECT COUNT(*) FROM cvm_data.ipo_oferta_distribuicao"),
+        ("ipo oferta_inicial='S'", "SELECT COUNT(*) FROM cvm_data.ipo_oferta_distribuicao WHERE oferta_inicial='S'"),
+        ("ipo oferta_inicial='S' com cnpj_emissor", "SELECT COUNT(*) FROM cvm_data.ipo_oferta_distribuicao WHERE oferta_inicial='S' AND cnpj_emissor IS NOT NULL"),
+        ("ipo oferta_inicial='S' com nome_emissor", "SELECT COUNT(*) FROM cvm_data.ipo_oferta_distribuicao WHERE oferta_inicial='S' AND nome_emissor IS NOT NULL"),
+        ("cad_valor_mobiliario total", "SELECT COUNT(*) FROM cvm_data.cad_valor_mobiliario"),
+        ("cad_valor_mobiliario ações", "SELECT COUNT(*) FROM cvm_data.cad_valor_mobiliario WHERE valor_mobiliario ILIKE ANY(ARRAY['%Ações Ordinárias%','%Ações Preferenciais%','%Units%'])"),
+    ]
+    log.info("\n  === DIAGNÓSTICO DO JOIN ===")
+    with conn.cursor() as cur:
+        for label, sql in checks:
+            try:
+                cur.execute(sql)
+                n = cur.fetchone()[0]
+                log.info(f"    {label}: {n:,}")
+            except Exception as e:
+                log.warning(f"    {label}: ERRO — {e}")
+                conn.rollback()
+
+    # Amostra de CNPJ para conferir formato
+    try:
+        sample_sql = """
+            SELECT cnpj_emissor, nome_emissor
+            FROM cvm_data.ipo_oferta_distribuicao
+            WHERE oferta_inicial='S' AND cnpj_emissor IS NOT NULL
+            LIMIT 5
+        """
+        with conn.cursor() as cur:
+            cur.execute(sample_sql)
+            rows = cur.fetchall()
+        log.info("\n    Amostra cnpj_emissor (com valor):")
+        for r in rows:
+            log.info(f"      cnpj={r[0]}  nome={r[1]}")
+    except Exception as e:
+        log.warning(f"    Amostra CNPJ falhou: {e}")
+        conn.rollback()
 
 
 # ─── BRAPI API ────────────────────────────────────────────────────────────────
